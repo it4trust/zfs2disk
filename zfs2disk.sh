@@ -1,6 +1,6 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.2 - Auto-Target Naming
+# Version 1.3 - Path Preservation
 
 LOGFILE="/var/log/zfs2disk.log"
 STATUSFILE="/var/log/zfs2disk_status"
@@ -190,11 +190,20 @@ for SRC in "${SOURCE_DATASETS[@]}"; do
         continue
     fi
     
-    # Automatische Namensgebung:
-    # Aus "rpool/data/vm-100-disk-0" wird "vm-100-disk-0"
-    TARGET_NAME=$(basename "$SRC")
-    DST="$POOL_NAME/$TARGET_NAME"
+    # Automatische Namensgebung mit Pfaderhaltung:
+    # SRC: "rpool/data/vm-100-disk-0"
+    # ${SRC#*/} entfernt alles bis zum ersten Slash (also "rpool/")
+    # REL_PATH: "data/vm-100-disk-0"
+    REL_PATH="${SRC#*/}"
+    DST="$POOL_NAME/$REL_PATH"
     SNAP="${SRC}@${SNAP_SUFFIX}"
+
+    # Sicherstellen, dass Eltern-Datasets existieren (z.B. backuppool/data)
+    # ${DST%/*} entfernt den letzten Teil (den Dataset-Namen) und gibt den Pfad zurück
+    PARENT_DST="${DST%/*}"
+    if [[ "$PARENT_DST" != "$POOL_NAME" ]]; then
+        zfs create -p "$PARENT_DST" 2>/dev/null || true
+    fi
 
     log "Sende $SNAP -> $DST"
     
