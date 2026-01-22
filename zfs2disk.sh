@@ -1,12 +1,14 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.4 - Multi-Config Support
+# Version 1.5 - Read-Only Source / Pass-Through Mode
 #
 # Aufruf: ./zfs2disk.sh <config_file>
-# Beispiel: ./zfs2disk.sh zfs2disk_daily.conf
+#
+# ÄNDERUNG V1.5: Erstellt keine eigenen Snapshots mehr, sondern sucht den
+# neuesten vorhandenen Snapshot (repliziert vom Kunden), um die Replikationskette
+# nicht zu beschädigen.
 
 LOGFILE="/var/log/zfs2disk.log"
-# STATUSFILE wird unten definiert, damit es pro Config unique ist (optional)
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -19,17 +21,14 @@ set -u           # Fail on unset variables
 ###############################################################################
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Prüfen, ob ein Argument übergeben wurde
 if [[ -z "${1:-}" ]]; then
     echo "FEHLER: Keine Konfigurationsdatei angegeben."
     echo "Verwendung: $0 <konfigurationsdatei>"
-    echo "Beispiel:   $0 zfs2disk_daily.conf"
     exit 1
 fi
 
 INPUT_CONFIG="$1"
 
-# Prüfen, ob Datei direkt existiert (absoluter Pfad) oder im Skript-Dir liegt
 if [[ -f "$INPUT_CONFIG" ]]; then
     CONFIG_FILE="$INPUT_CONFIG"
 elif [[ -f "$SCRIPT_DIR/$INPUT_CONFIG" ]]; then
@@ -42,33 +41,25 @@ fi
 source "$CONFIG_FILE"
 
 ###############################################################################
-# CheckMK & Logging Basics (Dynamisch angepasst)
+# CheckMK & Logging Basics
 ###############################################################################
 CHECKMK_SPOOL_DIR="/var/lib/check_mk_agent/spool"
 HOSTNAME=$(hostname -f)
-
-# Wir leiten den Service-Namen vom Config-Dateinamen ab (ohne Pfad und Endung)
-# z.B. zfs2disk_daily.conf -> Service: zfs2disk_daily
 CONFIG_BASENAME=$(basename "$CONFIG_FILE")
 SERVICE_NAME="${CONFIG_BASENAME%.*}"
-
-# Statusfile ebenfalls trennen, falls gewünscht (sonst überschreiben sich die Jobs gegenseitig)
 STATUSFILE="/var/log/${SERVICE_NAME}_status"
 SPOOL_FILE="${CHECKMK_SPOOL_DIR}/90000_${HOSTNAME}:${SERVICE_NAME}"
 
 log() {
-    # Wir fügen den Config-Namen ins Log ein, damit man im Logfile sieht, welcher Job das war
     echo "$(date +'%Y-%m-%d %H:%M:%S') [$SERVICE_NAME] - $1" | tee -a "$LOGFILE"
 }
 
 set_status() {
-    # $1 = Exit Code (0=OK, 2=CRIT), $2 = Text
     echo "LastStatus: $1"  > "$STATUSFILE"
     echo "LastMessage: $2" >> "$STATUSFILE"
 }
 
 create_checkmk_spool() {
-    # $1 = Status Code (0=OK, 1=WARN, 2=CRIT), $2 = Text
     mkdir -p "$CHECKMK_SPOOL_DIR"
     cat > "$SPOOL_FILE" << EOF
 <<<local>>>
@@ -83,12 +74,10 @@ handle_error() {
     set_status 2 "$msg"
     create_checkmk_spool 2 "$msg"
 
-    # Versuche Pool zu exportieren, falls er noch gemountet ist (Clean Exit)
     if zpool list "$POOL_NAME" &>/dev/null; then
         log "Not-Export des Pools..."
         zpool export "$POOL_NAME" || true
     fi
-
     exit 1
 }
 
@@ -99,13 +88,9 @@ trap 'handle_error "Unerwarteter Abbruch des Skripts" $LINENO' ERR
 ###############################################################################
 is_excluded() {
     local ds="$1"
-    # Prüfen ob EXCLUDE_DATASETS überhaupt gesetzt ist, um Fehler bei leerem Array zu vermeiden
     if [ -z "${EXCLUDE_DATASETS+x}" ]; then return 1; fi
-    
     for ex in "${EXCLUDE_DATASETS[@]}"; do
-        if [[ "$ds" == "$ex" ]]; then
-            return 0
-        fi
+        if [[ "$ds" == "$ex" ]]; then return 0; fi
     done
     return 1
 }
@@ -113,14 +98,13 @@ is_excluded() {
 ###############################################################################
 # Backup beginnt
 ###############################################################################
-log "##### Backup-Prozess gestartet (Config: $CONFIG_BASENAME) #####"
+log "##### Backup-Prozess gestartet (Read-Only Mode) #####"
 create_checkmk_spool 1 "Backup läuft..."
 
 ###############################################################################
 # 1. Externe Platte finden
 ###############################################################################
 EXTERNAL_DEVICE=""
-
 for serial in "${EXTERNAL_SERIALS[@]}"; do
     dev=$(ls /dev/disk/by-id/ | grep -E "^${serial}$" | head -n1 || true)
     if [[ -n "$dev" ]]; then
@@ -129,7 +113,6 @@ for serial in "${EXTERNAL_SERIALS[@]}"; do
         break
     fi
 done
-
 [[ -z "$EXTERNAL_DEVICE" ]] && handle_error "Keine externe Platte gefunden." $LINENO
 
 ###############################################################################
@@ -149,7 +132,6 @@ log "Erstelle neuen Pool '$POOL_NAME'..."
 zpool create -f -o ashift=12 "$POOL_NAME" /dev/disk/by-id/"$EXTERNAL_DEVICE" \
     || handle_error "Pool konnte nicht erstellt werden." $LINENO
 
-# Auto-Snapshot auf dem Backup-Medium deaktivieren
 zfs set com.sun:auto-snapshot=false "$POOL_NAME" || true
 
 ###############################################################################
@@ -157,7 +139,6 @@ zfs set com.sun:auto-snapshot=false "$POOL_NAME" || true
 ###############################################################################
 if [ ${#VM_IDS[@]} -gt 0 ]; then
     log "Fahre Maschinen herunter: ${VM_IDS[*]}"
-
     for vm in "${VM_IDS[@]}"; do
         if qm status "$vm" &>/dev/null; then
             state=$(qm status "$vm" | awk '{print $2}')
@@ -165,11 +146,8 @@ if [ ${#VM_IDS[@]} -gt 0 ]; then
         elif pct status "$vm" &>/dev/null; then
             state=$(pct status "$vm" | awk -F": " '{print $2}')
             [[ "$state" != "stopped" ]] && pct shutdown "$vm" && log "LXC $vm Shutdown initiiert."
-        else
-            log "WARNUNG: Maschine $vm nicht gefunden."
         fi
     done
-
     log "Warte $WAIT_AFTER_CRITICAL Sekunden auf Shutdown..."
     sleep "$WAIT_AFTER_CRITICAL"
 else
@@ -177,52 +155,36 @@ else
 fi
 
 ###############################################################################
-# 5. alte Backup-Snapshots entfernen
+# 5. Snapshots senden (Pass-Through Modus)
 ###############################################################################
-log "Entferne alte Backup-Snapshots..."
+# HIER WURDE GEÄNDERT: Keine Erstellung neuer Snapshots, nur Suche und Senden.
 
-for DS in "${SOURCE_DATASETS[@]}"; do
-    if is_excluded "$DS"; then
-        continue
-    fi
-    # Nur Snapshots löschen, die mit "backup-" beginnen (oder deinem Suffix entsprechen)
-    snaps=$(zfs list -H -o name -t snapshot "$DS" | grep "@${SNAP_SUFFIX}" || true)
-
-    for snap in $snaps; do
-        # Wir löschen hier strikt den alten Snapshot dieses Jobs
-        zfs destroy -r "$snap" || true
-    done
-done
-
-###############################################################################
-# 6. neue Snapshots erstellen
-###############################################################################
-log "Erstelle neue Snapshots ($SNAP_SUFFIX)..."
-
-for DS in "${SOURCE_DATASETS[@]}"; do
-    if is_excluded "$DS"; then
-        log "Überspringe Snapshot (exclude): $DS"
-        continue
-    fi
-
-    zfs snapshot -r "${DS}@${SNAP_SUFFIX}" \
-        || handle_error "Snapshot fehlgeschlagen: $DS" $LINENO
-done
-
-###############################################################################
-# 7. Snapshots senden
-###############################################################################
-log "Übertrage Snapshots auf $POOL_NAME..."
+log "Suche neueste Snapshots und übertrage..."
 
 for SRC in "${SOURCE_DATASETS[@]}"; do
     if is_excluded "$SRC"; then
         continue
     fi
 
+    # 1. Neuesten Snapshot ermitteln
+    # -t snapshot: Nur Snapshots
+    # -o name: Nur den Namen ausgeben
+    # -S creation: Sortieren nach Erstellung (Neueste zuerst, großes S)
+    # -d 1: Nur Snapshots dieses Datasets, nicht rekursiv (rekursiv wird gesendet, aber wir brauchen EINEN Anker)
+    # head -n 1: Den allerersten (also neuesten) nehmen
+    
+    LATEST_SNAP=$(zfs list -H -t snapshot -o name -S creation -d 1 "$SRC" 2>/dev/null | head -n 1)
+
+    if [[ -z "$LATEST_SNAP" ]]; then
+        log "WARNUNG: Kein Snapshot für '$SRC' gefunden. Überspringe Dataset."
+        # Wir setzen hier keinen Error, damit andere Datasets noch laufen können.
+        continue
+    fi
+
     # Automatische Namensgebung mit Pfaderhaltung:
+    # SRC: "rpool/repl/KUNDE/data" -> REL_PATH: "repl/KUNDE/data"
     REL_PATH="${SRC#*/}"
     DST="$POOL_NAME/$REL_PATH"
-    SNAP="${SRC}@${SNAP_SUFFIX}"
 
     # Sicherstellen, dass Eltern-Datasets existieren
     PARENT_DST="${DST%/*}"
@@ -230,21 +192,21 @@ for SRC in "${SOURCE_DATASETS[@]}"; do
         zfs create -p "$PARENT_DST" 2>/dev/null || true
     fi
 
-    log "Sende $SNAP -> $DST"
+    log "Sende neuesten Snapshot: $LATEST_SNAP -> $DST"
 
-    # zfs receive erstellt das Dataset im Ziel automatisch
-    zfs send -R "$SNAP" | zfs receive -F -u "$DST" \
-        || handle_error "Fehler beim Transfer: $SRC -> $DST" $LINENO
+    # -R (Replication Stream): Sendet den Snapshot und alle Eigenschaften (und Kinder, falls im Snap enthalten)
+    zfs send -R "$LATEST_SNAP" | zfs receive -F -u "$DST" \
+        || handle_error "Fehler beim Transfer: $LATEST_SNAP -> $DST" $LINENO
 done
 
 ###############################################################################
-# 8. Pool exportieren
+# 6. Pool exportieren
 ###############################################################################
 log "Exportiere Pool '$POOL_NAME'..."
 zpool export "$POOL_NAME" || handle_error "Konnte Pool nicht exportieren." $LINENO
 
 ###############################################################################
-# 9. VMs starten
+# 7. VMs starten
 ###############################################################################
 if [ ${#VM_IDS[@]} -gt 0 ]; then
     log "Starte Maschinen neu..."
@@ -258,7 +220,7 @@ if [ ${#VM_IDS[@]} -gt 0 ]; then
 fi
 
 ###############################################################################
-# 10. Abschluss
+# 8. Abschluss
 ###############################################################################
 log "##### Backup erfolgreich abgeschlossen #####"
 set_status 0 "Backup erfolgreich"
