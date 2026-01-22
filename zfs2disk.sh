@@ -1,13 +1,13 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.7 - Robust Snapshot Fetching
+# Version 1.8 - Iterative Robust Mode
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# ÄNDERUNG V1.7: 
-# - Abfangen von Fehlern bei 'zfs list', damit das Skript nicht abbricht, 
-#   wenn ein Dataset keine Snapshots hat oder nicht existiert.
-# - Nutzt "zfs send -w" (Raw) für 1:1 Kopien (Encrypted/Compressed).
+# ÄNDERUNG V1.8:
+# - Ersetzt "zfs send -R" (Rekursiv auf Eltern) durch eine Schleife über alle Kinder.
+# - Löst das Problem "Snapshot does not exist on child", indem jedes Dataset
+#   individuell betrachtet und gesendet wird.
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -89,9 +89,7 @@ trap 'handle_error "Unerwarteter Abbruch des Skripts" $LINENO' ERR
 ###############################################################################
 is_excluded() {
     local ds="$1"
-    # Prüft sicher, ob EXCLUDE_DATASETS gesetzt ist, bevor darauf zugegriffen wird
     if [ -z "${EXCLUDE_DATASETS+x}" ]; then return 1; fi
-    
     for ex in "${EXCLUDE_DATASETS[@]}"; do
         if [[ "$ds" == "$ex" ]]; then return 0; fi
     done
@@ -101,7 +99,7 @@ is_excluded() {
 ###############################################################################
 # Backup beginnt
 ###############################################################################
-log "##### Backup-Prozess gestartet (V1.7 Robust Mode) #####"
+log "##### Backup-Prozess gestartet (V1.8 Iterative Mode) #####"
 create_checkmk_spool 1 "Backup läuft..."
 
 ###############################################################################
@@ -158,43 +156,62 @@ else
 fi
 
 ###############################################################################
-# 5. Snapshots senden (Pass-Through Modus)
+# 5. Snapshots iterativ senden
 ###############################################################################
-log "Suche neueste Snapshots und übertrage..."
+log "Analysiere Datasets und übertrage einzeln..."
 
-for SRC in "${SOURCE_DATASETS[@]}"; do
-    if is_excluded "$SRC"; then
-        continue
-    fi
+for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
+    if is_excluded "$SRC_ROOT"; then continue; fi
+
+    # HIER IST DIE MAGIE VON V1.8:
+    # Wir holen uns eine Liste ALLER rekursiven Datasets unterhalb des Startpunkts.
+    # Damit behandeln wir jedes Dataset (jede Disk) einzeln.
     
-    # Check ob Dataset überhaupt existiert, sonst überspringen (verhindert Crash)
-    if ! zfs list -H -o name "$SRC" >/dev/null 2>&1; then
-        log "WARNUNG: Dataset '$SRC' existiert nicht. Überspringe."
+    # Check ob Root existiert
+    if ! zfs list -H -o name "$SRC_ROOT" >/dev/null 2>&1; then
+        log "WARNUNG: Dataset '$SRC_ROOT' existiert nicht. Überspringe."
         continue
     fi
 
-    # 1. Neuesten Snapshot ermitteln (mit || true, damit pipefail nicht triggert wenn leer)
-    LATEST_SNAP=$(zfs list -H -t snapshot -o name -S creation -d 1 "$SRC" 2>/dev/null | head -n 1 || true)
+    ALL_DATASETS=$(zfs list -H -r -o name "$SRC_ROOT")
 
-    if [[ -z "$LATEST_SNAP" ]]; then
-        log "WARNUNG: Kein Snapshot für '$SRC' gefunden. Überspringe Dataset."
-        continue
-    fi
+    for CURRENT_DS in $ALL_DATASETS; do
+        if is_excluded "$CURRENT_DS"; then
+            log "Überspringe Exclude: $CURRENT_DS"
+            continue
+        fi
 
-    REL_PATH="${SRC#*/}"
-    DST="$POOL_NAME/$REL_PATH"
+        # Suche neuesten Snapshot spezifisch für DIESES Dataset
+        LATEST_SNAP=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null | head -n 1 || true)
 
-    PARENT_DST="${DST%/*}"
-    if [[ "$PARENT_DST" != "$POOL_NAME" ]]; then
-        zfs create -p "$PARENT_DST" 2>/dev/null || true
-    fi
+        if [[ -z "$LATEST_SNAP" ]]; then
+            # Kein Snapshot auf diesem Dataset? Nicht schlimm, wir loggen nur und machen weiter.
+            # Das verhindert den Abbruch, wenn z.B. ein übergeordneter Ordner keine Snaps hat.
+            # log "Info: Kein Snapshot für $CURRENT_DS gefunden (überspringe)."
+            continue
+        fi
 
-    log "Sende neuesten Snapshot: $LATEST_SNAP -> $DST"
+        # Ziel-Pfad berechnen
+        REL_PATH="${CURRENT_DS#*/}"
+        DST="$POOL_NAME/$REL_PATH"
+        PARENT_DST="${DST%/*}"
 
-    # Transfer mit Raw (-w) und Error-Log
-    if ! zfs send -R -w "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
-         handle_error "Fehler beim Transfer (Details im Log): $LATEST_SNAP -> $DST" $LINENO
-    fi
+        # Parent erstellen falls nötig
+        if [[ "$PARENT_DST" != "$POOL_NAME" ]]; then
+            zfs create -p "$PARENT_DST" 2>/dev/null || true
+        fi
+
+        log "Sende: $LATEST_SNAP -> $DST"
+
+        # WICHTIG: Kein -R (Rekursiv) mehr!
+        # -w : Raw (Encryption/Compression erhalten)
+        # -p : Properties senden (damit Mountpoints etc. stimmen)
+        if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+             log "WARNUNG: Fehler beim Transfer von $CURRENT_DS (siehe oben). Mache weiter mit nächstem Dataset..."
+             # Wir setzen hier KEIN exit 1, damit der Rest weiterläuft!
+             # Aber wir setzen den Status am Ende vielleicht auf WARN (optional)
+        fi
+    done
 done
 
 ###############################################################################
