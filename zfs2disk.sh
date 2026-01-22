@@ -1,9 +1,12 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.3 - Path Preservation
+# Version 1.4 - Multi-Config Support
+#
+# Aufruf: ./zfs2disk.sh <config_file>
+# Beispiel: ./zfs2disk.sh zfs2disk_daily.conf
 
 LOGFILE="/var/log/zfs2disk.log"
-STATUSFILE="/var/log/zfs2disk_status"
+# STATUSFILE wird unten definiert, damit es pro Config unique ist (optional)
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -12,28 +15,50 @@ set -o pipefail  # Return code of pipes is reflected
 set -u           # Fail on unset variables
 
 ###############################################################################
-# Konfiguration laden
+# Konfiguration laden (Argument-basiert)
 ###############################################################################
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/zfs2disk.conf"
 
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-else
-    echo "Konfigurationsdatei $CONFIG_FILE nicht gefunden." >&2
+# Prüfen, ob ein Argument übergeben wurde
+if [[ -z "${1:-}" ]]; then
+    echo "FEHLER: Keine Konfigurationsdatei angegeben."
+    echo "Verwendung: $0 <konfigurationsdatei>"
+    echo "Beispiel:   $0 zfs2disk_daily.conf"
     exit 1
 fi
 
+INPUT_CONFIG="$1"
+
+# Prüfen, ob Datei direkt existiert (absoluter Pfad) oder im Skript-Dir liegt
+if [[ -f "$INPUT_CONFIG" ]]; then
+    CONFIG_FILE="$INPUT_CONFIG"
+elif [[ -f "$SCRIPT_DIR/$INPUT_CONFIG" ]]; then
+    CONFIG_FILE="$SCRIPT_DIR/$INPUT_CONFIG"
+else
+    echo "FEHLER: Konfigurationsdatei '$INPUT_CONFIG' nicht gefunden." >&2
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
 ###############################################################################
-# CheckMK & Logging Basics
+# CheckMK & Logging Basics (Dynamisch angepasst)
 ###############################################################################
 CHECKMK_SPOOL_DIR="/var/lib/check_mk_agent/spool"
 HOSTNAME=$(hostname -f)
-SERVICE_NAME="zfs2disk"
+
+# Wir leiten den Service-Namen vom Config-Dateinamen ab (ohne Pfad und Endung)
+# z.B. zfs2disk_daily.conf -> Service: zfs2disk_daily
+CONFIG_BASENAME=$(basename "$CONFIG_FILE")
+SERVICE_NAME="${CONFIG_BASENAME%.*}"
+
+# Statusfile ebenfalls trennen, falls gewünscht (sonst überschreiben sich die Jobs gegenseitig)
+STATUSFILE="/var/log/${SERVICE_NAME}_status"
 SPOOL_FILE="${CHECKMK_SPOOL_DIR}/90000_${HOSTNAME}:${SERVICE_NAME}"
 
 log() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
+    # Wir fügen den Config-Namen ins Log ein, damit man im Logfile sieht, welcher Job das war
+    echo "$(date +'%Y-%m-%d %H:%M:%S') [$SERVICE_NAME] - $1" | tee -a "$LOGFILE"
 }
 
 set_status() {
@@ -57,13 +82,13 @@ handle_error() {
     log "FEHLER (Zeile $line): $msg"
     set_status 2 "$msg"
     create_checkmk_spool 2 "$msg"
-    
+
     # Versuche Pool zu exportieren, falls er noch gemountet ist (Clean Exit)
     if zpool list "$POOL_NAME" &>/dev/null; then
         log "Not-Export des Pools..."
         zpool export "$POOL_NAME" || true
     fi
-    
+
     exit 1
 }
 
@@ -74,6 +99,9 @@ trap 'handle_error "Unerwarteter Abbruch des Skripts" $LINENO' ERR
 ###############################################################################
 is_excluded() {
     local ds="$1"
+    # Prüfen ob EXCLUDE_DATASETS überhaupt gesetzt ist, um Fehler bei leerem Array zu vermeiden
+    if [ -z "${EXCLUDE_DATASETS+x}" ]; then return 1; fi
+    
     for ex in "${EXCLUDE_DATASETS[@]}"; do
         if [[ "$ds" == "$ex" ]]; then
             return 0
@@ -85,7 +113,7 @@ is_excluded() {
 ###############################################################################
 # Backup beginnt
 ###############################################################################
-log "##### Backup-Prozess gestartet #####"
+log "##### Backup-Prozess gestartet (Config: $CONFIG_BASENAME) #####"
 create_checkmk_spool 1 "Backup läuft..."
 
 ###############################################################################
@@ -129,7 +157,7 @@ zfs set com.sun:auto-snapshot=false "$POOL_NAME" || true
 ###############################################################################
 if [ ${#VM_IDS[@]} -gt 0 ]; then
     log "Fahre Maschinen herunter: ${VM_IDS[*]}"
-    
+
     for vm in "${VM_IDS[@]}"; do
         if qm status "$vm" &>/dev/null; then
             state=$(qm status "$vm" | awk '{print $2}')
@@ -141,7 +169,7 @@ if [ ${#VM_IDS[@]} -gt 0 ]; then
             log "WARNUNG: Maschine $vm nicht gefunden."
         fi
     done
-    
+
     log "Warte $WAIT_AFTER_CRITICAL Sekunden auf Shutdown..."
     sleep "$WAIT_AFTER_CRITICAL"
 else
@@ -157,11 +185,12 @@ for DS in "${SOURCE_DATASETS[@]}"; do
     if is_excluded "$DS"; then
         continue
     fi
-    # Nur Snapshots löschen, die mit "backup-" beginnen
-    snaps=$(zfs list -H -o name -t snapshot "$DS" | grep "@backup-" || true)
+    # Nur Snapshots löschen, die mit "backup-" beginnen (oder deinem Suffix entsprechen)
+    snaps=$(zfs list -H -o name -t snapshot "$DS" | grep "@${SNAP_SUFFIX}" || true)
 
     for snap in $snaps; do
-        [[ "$snap" != "${DS}@${SNAP_SUFFIX}" ]] && zfs destroy -r "$snap" || true
+        # Wir löschen hier strikt den alten Snapshot dieses Jobs
+        zfs destroy -r "$snap" || true
     done
 done
 
@@ -189,24 +218,20 @@ for SRC in "${SOURCE_DATASETS[@]}"; do
     if is_excluded "$SRC"; then
         continue
     fi
-    
+
     # Automatische Namensgebung mit Pfaderhaltung:
-    # SRC: "rpool/data/vm-100-disk-0"
-    # ${SRC#*/} entfernt alles bis zum ersten Slash (also "rpool/")
-    # REL_PATH: "data/vm-100-disk-0"
     REL_PATH="${SRC#*/}"
     DST="$POOL_NAME/$REL_PATH"
     SNAP="${SRC}@${SNAP_SUFFIX}"
 
-    # Sicherstellen, dass Eltern-Datasets existieren (z.B. backuppool/data)
-    # ${DST%/*} entfernt den letzten Teil (den Dataset-Namen) und gibt den Pfad zurück
+    # Sicherstellen, dass Eltern-Datasets existieren
     PARENT_DST="${DST%/*}"
     if [[ "$PARENT_DST" != "$POOL_NAME" ]]; then
         zfs create -p "$PARENT_DST" 2>/dev/null || true
     fi
 
     log "Sende $SNAP -> $DST"
-    
+
     # zfs receive erstellt das Dataset im Ziel automatisch
     zfs send -R "$SNAP" | zfs receive -F -u "$DST" \
         || handle_error "Fehler beim Transfer: $SRC -> $DST" $LINENO
