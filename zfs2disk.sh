@@ -1,12 +1,13 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.5 - Read-Only Source / Pass-Through Mode
+# Version 1.7 - Robust Snapshot Fetching
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# ÄNDERUNG V1.5: Erstellt keine eigenen Snapshots mehr, sondern sucht den
-# neuesten vorhandenen Snapshot (repliziert vom Kunden), um die Replikationskette
-# nicht zu beschädigen.
+# ÄNDERUNG V1.7: 
+# - Abfangen von Fehlern bei 'zfs list', damit das Skript nicht abbricht, 
+#   wenn ein Dataset keine Snapshots hat oder nicht existiert.
+# - Nutzt "zfs send -w" (Raw) für 1:1 Kopien (Encrypted/Compressed).
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -88,7 +89,9 @@ trap 'handle_error "Unerwarteter Abbruch des Skripts" $LINENO' ERR
 ###############################################################################
 is_excluded() {
     local ds="$1"
+    # Prüft sicher, ob EXCLUDE_DATASETS gesetzt ist, bevor darauf zugegriffen wird
     if [ -z "${EXCLUDE_DATASETS+x}" ]; then return 1; fi
+    
     for ex in "${EXCLUDE_DATASETS[@]}"; do
         if [[ "$ds" == "$ex" ]]; then return 0; fi
     done
@@ -98,7 +101,7 @@ is_excluded() {
 ###############################################################################
 # Backup beginnt
 ###############################################################################
-log "##### Backup-Prozess gestartet (Read-Only Mode) #####"
+log "##### Backup-Prozess gestartet (V1.7 Robust Mode) #####"
 create_checkmk_spool 1 "Backup läuft..."
 
 ###############################################################################
@@ -157,36 +160,30 @@ fi
 ###############################################################################
 # 5. Snapshots senden (Pass-Through Modus)
 ###############################################################################
-# HIER WURDE GEÄNDERT: Keine Erstellung neuer Snapshots, nur Suche und Senden.
-
 log "Suche neueste Snapshots und übertrage..."
 
 for SRC in "${SOURCE_DATASETS[@]}"; do
     if is_excluded "$SRC"; then
         continue
     fi
-
-    # 1. Neuesten Snapshot ermitteln
-    # -t snapshot: Nur Snapshots
-    # -o name: Nur den Namen ausgeben
-    # -S creation: Sortieren nach Erstellung (Neueste zuerst, großes S)
-    # -d 1: Nur Snapshots dieses Datasets, nicht rekursiv (rekursiv wird gesendet, aber wir brauchen EINEN Anker)
-    # head -n 1: Den allerersten (also neuesten) nehmen
     
-    LATEST_SNAP=$(zfs list -H -t snapshot -o name -S creation -d 1 "$SRC" 2>/dev/null | head -n 1)
-
-    if [[ -z "$LATEST_SNAP" ]]; then
-        log "WARNUNG: Kein Snapshot für '$SRC' gefunden. Überspringe Dataset."
-        # Wir setzen hier keinen Error, damit andere Datasets noch laufen können.
+    # Check ob Dataset überhaupt existiert, sonst überspringen (verhindert Crash)
+    if ! zfs list -H -o name "$SRC" >/dev/null 2>&1; then
+        log "WARNUNG: Dataset '$SRC' existiert nicht. Überspringe."
         continue
     fi
 
-    # Automatische Namensgebung mit Pfaderhaltung:
-    # SRC: "rpool/repl/KUNDE/data" -> REL_PATH: "repl/KUNDE/data"
+    # 1. Neuesten Snapshot ermitteln (mit || true, damit pipefail nicht triggert wenn leer)
+    LATEST_SNAP=$(zfs list -H -t snapshot -o name -S creation -d 1 "$SRC" 2>/dev/null | head -n 1 || true)
+
+    if [[ -z "$LATEST_SNAP" ]]; then
+        log "WARNUNG: Kein Snapshot für '$SRC' gefunden. Überspringe Dataset."
+        continue
+    fi
+
     REL_PATH="${SRC#*/}"
     DST="$POOL_NAME/$REL_PATH"
 
-    # Sicherstellen, dass Eltern-Datasets existieren
     PARENT_DST="${DST%/*}"
     if [[ "$PARENT_DST" != "$POOL_NAME" ]]; then
         zfs create -p "$PARENT_DST" 2>/dev/null || true
@@ -194,9 +191,10 @@ for SRC in "${SOURCE_DATASETS[@]}"; do
 
     log "Sende neuesten Snapshot: $LATEST_SNAP -> $DST"
 
-    # -R (Replication Stream): Sendet den Snapshot und alle Eigenschaften (und Kinder, falls im Snap enthalten)
-    zfs send -R "$LATEST_SNAP" | zfs receive -F -u "$DST" \
-        || handle_error "Fehler beim Transfer: $LATEST_SNAP -> $DST" $LINENO
+    # Transfer mit Raw (-w) und Error-Log
+    if ! zfs send -R -w "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+         handle_error "Fehler beim Transfer (Details im Log): $LATEST_SNAP -> $DST" $LINENO
+    fi
 done
 
 ###############################################################################
