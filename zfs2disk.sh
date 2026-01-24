@@ -1,13 +1,12 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.9 - Full History Mode
+# Version 2.0 - Hybrid Mode (Latest vs. Full History)
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# ÄNDERUNG V1.9:
-# - Überträgt nun die KOMPLETTE Snapshot-Historie.
-# - Nutzt eine 2-Schritt-Logik (Initial + Inkrementell), um ohne "-R"
-#   alle Zwischen-Snapshots zu erhalten, ohne bei Inkonsistenzen abzubrechen.
+# NEU IN V2.0:
+# - Unterstützung für BACKUP_MODE="latest" (nur neuester Snap) oder "full" (komplette Historie).
+# - Wird in der .conf Datei definiert. Default ist "full".
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -40,6 +39,9 @@ else
 fi
 
 source "$CONFIG_FILE"
+
+# Default für BACKUP_MODE setzen, falls nicht in Config definiert
+BACKUP_MODE="${BACKUP_MODE:-full}"
 
 ###############################################################################
 # CheckMK & Logging Basics
@@ -99,8 +101,8 @@ is_excluded() {
 ###############################################################################
 # Backup beginnt
 ###############################################################################
-log "##### Backup-Prozess gestartet (V1.9 Full History Mode) #####"
-create_checkmk_spool 1 "Backup läuft..."
+log "##### Backup-Prozess gestartet (Mode: $BACKUP_MODE) #####"
+create_checkmk_spool 1 "Backup läuft (Mode: $BACKUP_MODE)..."
 
 ###############################################################################
 # 1. Externe Platte finden
@@ -156,9 +158,9 @@ else
 fi
 
 ###############################################################################
-# 5. Snapshots mit Historie senden
+# 5. Snapshots senden (Hybrid Logic)
 ###############################################################################
-log "Analysiere Datasets und übertrage Historie..."
+log "Analysiere Datasets und übertrage..."
 
 for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
     if is_excluded "$SRC_ROOT"; then continue; fi
@@ -178,6 +180,7 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
         fi
 
         # 1. Alle Snapshots holen (sortiert nach Erstellung: Alt -> Neu)
+        # Wir brauchen die Liste in beiden Fällen, um den neuesten zu finden
         SNAPS_LIST=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null)
         
         if [[ -z "$SNAPS_LIST" ]]; then
@@ -185,11 +188,8 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             continue
         fi
 
-        # Neuesten und Ältesten ermitteln
-        # head -n 1 ist der neuste (weil -S creation sortiert)
-        # tail -n 1 ist der älteste
+        # Neuesten Snapshot ermitteln (head -n 1 weil -S creation sortiert)
         LATEST_SNAP=$(echo "$SNAPS_LIST" | head -n 1)
-        OLDEST_SNAP=$(echo "$SNAPS_LIST" | tail -n 1)
 
         # Ziel-Pfad vorbereiten
         REL_PATH="${CURRENT_DS#*/}"
@@ -200,27 +200,41 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             zfs create -p "$PARENT_DST" 2>/dev/null || true
         fi
 
-        # Transfer-Logik für Historie
-        if [[ "$LATEST_SNAP" == "$OLDEST_SNAP" ]]; then
-            # Fall A: Es gibt nur genau einen Snapshot. Einfacher Transfer.
-            log "Sende Single-Snapshot: $LATEST_SNAP -> $DST"
-            if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
-                 log "WARNUNG: Fehler beim Single-Transfer von $CURRENT_DS."
-            fi
-        else
-            # Fall B: Mehrere Snapshots. Wir wollen die Historie.
-            # Schritt 1: Den ältesten Snapshot als Basis senden (Full Send)
-            log "Sende Basis ($OLDEST_SNAP) und Historie bis ($LATEST_SNAP) -> $DST"
+        # --- ENTSCHEIDUNG: LATEST ONLY vs. FULL HISTORY ---
+        
+        if [[ "$BACKUP_MODE" == "latest" ]]; then
+            # === MODE: LATEST ONLY ===
+            # Wir senden nur den allerletzten Snapshot. Historie wird ignoriert.
+            log "Sende Latest ($LATEST_SNAP) -> $DST"
             
-            # Erst den ältesten senden (erzeugt das Dataset am Ziel)
-            if ! zfs send -w -p "$OLDEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
-                 log "WARNUNG: Fehler beim Basis-Transfer von $CURRENT_DS."
-                 continue
+            if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                 log "WARNUNG: Fehler beim Transfer (Latest) von $CURRENT_DS."
             fi
 
-            # Schritt 2: Inkrementelles Update zum neusten senden (-I nimmt alles dazwischen mit)
-            if ! zfs send -w -p -I "$OLDEST_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
-                 log "WARNUNG: Fehler beim History-Update von $CURRENT_DS."
+        else
+            # === MODE: FULL HISTORY (Default) ===
+            OLDEST_SNAP=$(echo "$SNAPS_LIST" | tail -n 1)
+
+            if [[ "$LATEST_SNAP" == "$OLDEST_SNAP" ]]; then
+                # Sonderfall: Nur ein Snapshot da, egal ob Full oder Latest
+                log "Sende Single-Snapshot ($LATEST_SNAP) -> $DST"
+                if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                     log "WARNUNG: Fehler beim Single-Transfer von $CURRENT_DS."
+                fi
+            else
+                # Echte Historie senden
+                log "Sende Basis ($OLDEST_SNAP) bis ($LATEST_SNAP) -> $DST"
+                
+                # Schritt 1: Basis
+                if ! zfs send -w -p "$OLDEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                     log "WARNUNG: Fehler beim Basis-Transfer von $CURRENT_DS."
+                     continue
+                fi
+
+                # Schritt 2: Inkrementell
+                if ! zfs send -w -p -I "$OLDEST_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                     log "WARNUNG: Fehler beim History-Update von $CURRENT_DS."
+                fi
             fi
         fi
     done
