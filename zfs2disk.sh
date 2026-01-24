@@ -1,13 +1,13 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 1.8 - Iterative Robust Mode
+# Version 1.9 - Full History Mode
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# ÄNDERUNG V1.8:
-# - Ersetzt "zfs send -R" (Rekursiv auf Eltern) durch eine Schleife über alle Kinder.
-# - Löst das Problem "Snapshot does not exist on child", indem jedes Dataset
-#   individuell betrachtet und gesendet wird.
+# ÄNDERUNG V1.9:
+# - Überträgt nun die KOMPLETTE Snapshot-Historie.
+# - Nutzt eine 2-Schritt-Logik (Initial + Inkrementell), um ohne "-R"
+#   alle Zwischen-Snapshots zu erhalten, ohne bei Inkonsistenzen abzubrechen.
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -99,7 +99,7 @@ is_excluded() {
 ###############################################################################
 # Backup beginnt
 ###############################################################################
-log "##### Backup-Prozess gestartet (V1.8 Iterative Mode) #####"
+log "##### Backup-Prozess gestartet (V1.9 Full History Mode) #####"
 create_checkmk_spool 1 "Backup läuft..."
 
 ###############################################################################
@@ -156,23 +156,19 @@ else
 fi
 
 ###############################################################################
-# 5. Snapshots iterativ senden
+# 5. Snapshots mit Historie senden
 ###############################################################################
-log "Analysiere Datasets und übertrage einzeln..."
+log "Analysiere Datasets und übertrage Historie..."
 
 for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
     if is_excluded "$SRC_ROOT"; then continue; fi
 
-    # HIER IST DIE MAGIE VON V1.8:
-    # Wir holen uns eine Liste ALLER rekursiven Datasets unterhalb des Startpunkts.
-    # Damit behandeln wir jedes Dataset (jede Disk) einzeln.
-    
-    # Check ob Root existiert
     if ! zfs list -H -o name "$SRC_ROOT" >/dev/null 2>&1; then
         log "WARNUNG: Dataset '$SRC_ROOT' existiert nicht. Überspringe."
         continue
     fi
 
+    # Rekursive Liste aller Datasets holen
     ALL_DATASETS=$(zfs list -H -r -o name "$SRC_ROOT")
 
     for CURRENT_DS in $ALL_DATASETS; do
@@ -181,35 +177,51 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             continue
         fi
 
-        # Suche neuesten Snapshot spezifisch für DIESES Dataset
-        LATEST_SNAP=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null | head -n 1 || true)
-
-        if [[ -z "$LATEST_SNAP" ]]; then
-            # Kein Snapshot auf diesem Dataset? Nicht schlimm, wir loggen nur und machen weiter.
-            # Das verhindert den Abbruch, wenn z.B. ein übergeordneter Ordner keine Snaps hat.
-            # log "Info: Kein Snapshot für $CURRENT_DS gefunden (überspringe)."
+        # 1. Alle Snapshots holen (sortiert nach Erstellung: Alt -> Neu)
+        SNAPS_LIST=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null)
+        
+        if [[ -z "$SNAPS_LIST" ]]; then
+            # Keine Snapshots -> Nichts zu tun
             continue
         fi
 
-        # Ziel-Pfad berechnen
+        # Neuesten und Ältesten ermitteln
+        # head -n 1 ist der neuste (weil -S creation sortiert)
+        # tail -n 1 ist der älteste
+        LATEST_SNAP=$(echo "$SNAPS_LIST" | head -n 1)
+        OLDEST_SNAP=$(echo "$SNAPS_LIST" | tail -n 1)
+
+        # Ziel-Pfad vorbereiten
         REL_PATH="${CURRENT_DS#*/}"
         DST="$POOL_NAME/$REL_PATH"
         PARENT_DST="${DST%/*}"
 
-        # Parent erstellen falls nötig
         if [[ "$PARENT_DST" != "$POOL_NAME" ]]; then
             zfs create -p "$PARENT_DST" 2>/dev/null || true
         fi
 
-        log "Sende: $LATEST_SNAP -> $DST"
+        # Transfer-Logik für Historie
+        if [[ "$LATEST_SNAP" == "$OLDEST_SNAP" ]]; then
+            # Fall A: Es gibt nur genau einen Snapshot. Einfacher Transfer.
+            log "Sende Single-Snapshot: $LATEST_SNAP -> $DST"
+            if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                 log "WARNUNG: Fehler beim Single-Transfer von $CURRENT_DS."
+            fi
+        else
+            # Fall B: Mehrere Snapshots. Wir wollen die Historie.
+            # Schritt 1: Den ältesten Snapshot als Basis senden (Full Send)
+            log "Sende Basis ($OLDEST_SNAP) und Historie bis ($LATEST_SNAP) -> $DST"
+            
+            # Erst den ältesten senden (erzeugt das Dataset am Ziel)
+            if ! zfs send -w -p "$OLDEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                 log "WARNUNG: Fehler beim Basis-Transfer von $CURRENT_DS."
+                 continue
+            fi
 
-        # WICHTIG: Kein -R (Rekursiv) mehr!
-        # -w : Raw (Encryption/Compression erhalten)
-        # -p : Properties senden (damit Mountpoints etc. stimmen)
-        if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
-             log "WARNUNG: Fehler beim Transfer von $CURRENT_DS (siehe oben). Mache weiter mit nächstem Dataset..."
-             # Wir setzen hier KEIN exit 1, damit der Rest weiterläuft!
-             # Aber wir setzen den Status am Ende vielleicht auf WARN (optional)
+            # Schritt 2: Inkrementelles Update zum neusten senden (-I nimmt alles dazwischen mit)
+            if ! zfs send -w -p -I "$OLDEST_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                 log "WARNUNG: Fehler beim History-Update von $CURRENT_DS."
+            fi
         fi
     done
 done
