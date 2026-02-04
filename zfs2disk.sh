@@ -1,13 +1,12 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 3.1 - Safe Import & Safety Checks
+# Version 3.2 - Fix Empty Snapshot Crash
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# NEU IN V3.1:
-# - Verbesserte Import-Logik (versucht Pfad-Import und Fallback).
-# - Safety-Check mit 'zdb': Wenn ein Pool auf der Disk erkannt wird, aber nicht
-#   importiert werden konnte, bricht das Skript ab, statt zu formatieren.
+# NEU IN V3.2:
+# - Fehlerbehebung: 'zfs list' führt nicht mehr zum Absturz, wenn ein Dataset
+#   keine Snapshots enthält (fügt "|| true" zur Liste hinzu).
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -142,25 +141,20 @@ if zpool list "$POOL_NAME" &>/dev/null; then
 else
     log "Versuche Pool '$POOL_NAME' zu importieren..."
     
-    # 1. Versuch: Spezifisch über Device-ID (Schnell & Sicher)
     if zpool import -d /dev/disk/by-id/ -f "$POOL_NAME" 2>/dev/null; then
         log "Import via /dev/disk/by-id erfolgreich."
         POOL_IMPORTED=1
-    # 2. Versuch: Globaler Scan (Falls Device-Link anders ist)
     elif zpool import -f "$POOL_NAME" 2>/dev/null; then
         log "Import via Global Scan erfolgreich."
         POOL_IMPORTED=1
     else
-        log "Import fehlgeschlagen."
+        log "Import fehlgeschlagen (Pool existiert wohl noch nicht)."
     fi
 fi
 
 # Wenn nicht importiert: Prüfen ob wir formatieren DÜRFEN
 if [[ "$POOL_IMPORTED" -eq 0 ]]; then
     
-    # SAFETY CHECK: Prüfen, ob auf der Platte ein ZFS Label für diesen Pool existiert
-    # zdb -l liest die ZFS Labels der Platte. Wenn dort der Name auftaucht, existiert der Pool,
-    # konnte aber nicht importiert werden (z.B. Fehler, Version mismatch, etc.)
     if [[ "$FORCE_FULL_WIPE" == "no" ]]; then
         if zdb -l "/dev/disk/by-id/$EXTERNAL_DEVICE" | grep -q "name: '$POOL_NAME'"; then
             handle_error "ABBRUCH! Pool '$POOL_NAME' auf Disk gefunden, aber Import fehlgeschlagen. Überschreibe nicht ohne FORCE_FULL_WIPE='yes'." $LINENO
@@ -205,7 +199,8 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
         continue
     fi
 
-    ALL_DATASETS=$(zfs list -H -r -o name "$SRC_ROOT")
+    # || true hinzugefügt, falls SRC_ROOT leer wäre (unwahrscheinlich, aber sicher)
+    ALL_DATASETS=$(zfs list -H -r -o name "$SRC_ROOT" || true)
 
     for CURRENT_DS in $ALL_DATASETS; do
         if is_excluded "$CURRENT_DS"; then
@@ -213,8 +208,13 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             continue
         fi
 
-        SNAPS_LIST=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null)
-        if [[ -z "$SNAPS_LIST" ]]; then continue; fi
+        # ERROR FIX: || true am Ende verhindert Skript-Abbruch bei 0 Snapshots
+        SNAPS_LIST=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null || true)
+        
+        if [[ -z "$SNAPS_LIST" ]]; then 
+            # Dataset hat keine Snapshots -> ist okay, weitermachen mit dem nächsten
+            continue 
+        fi
 
         LATEST_SNAP=$(echo "$SNAPS_LIST" | head -n 1)
         OLDEST_SNAP=$(echo "$SNAPS_LIST" | tail -n 1)
@@ -241,7 +241,8 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             fi
         else
             # Inkrementelles Update
-            LATEST_DEST_SNAP_FULL=$(zfs list -H -t snapshot -o name -S creation -d 1 "$DST" 2>/dev/null | head -n 1)
+            # ERROR FIX: || true hinzugefügt, falls Ziel keine Snapshots hat
+            LATEST_DEST_SNAP_FULL=$(zfs list -H -t snapshot -o name -S creation -d 1 "$DST" 2>/dev/null | head -n 1 || true)
             
             if [[ -z "$LATEST_DEST_SNAP_FULL" ]]; then
                 log "[FIX]  Ziel $DST existiert ohne Snapshots. Sende komplett neu."
