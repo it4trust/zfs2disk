@@ -1,13 +1,14 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 3.3 - Self Healing Mode
+# Version 3.4 - Smart Common Base Search
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# NEU IN V3.3:
-# - Self-Healing: Wenn inkrementelles Backup nicht möglich ist (Split-Brain /
-#   gemeinsamer Snapshot fehlt), wird das Ziel-Dataset automatisch gelöscht
-#   und komplett neu übertragen.
+# NEU IN V3.4:
+# - Behebt das "Frequent-Trap" Problem: Wenn der neueste Snapshot auf dem Ziel
+#   nicht mehr auf der Quelle existiert, sucht das Skript rückwärts durch die 
+#   Historie, bis es EINEN gemeinsamen Snapshot (z.B. Weekly) findet.
+# - Verhindert unnötige Full-Wipes, solange noch irgendeine gemeinsame Basis existiert.
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -209,6 +210,7 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             continue
         fi
 
+        # Snapshots auf Quelle holen (Neueste zuerst)
         SNAPS_LIST=$(zfs list -H -t snapshot -o name -S creation -d 1 "$CURRENT_DS" 2>/dev/null || true)
         
         if [[ -z "$SNAPS_LIST" ]]; then continue; fi
@@ -228,35 +230,52 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
         # --- UPDATE-LOGIK ---
 
         PERFORM_FULL_SEND=0
+        COMMON_BASE_SNAP=""
 
         if [[ "$DEST_EXISTS" -eq 0 ]]; then
             log "[INIT] Sende $CURRENT_DS komplett..."
             PERFORM_FULL_SEND=1
         else
-            # Inkrementell versuchen
-            LATEST_DEST_SNAP_FULL=$(zfs list -H -t snapshot -o name -S creation -d 1 "$DST" 2>/dev/null | head -n 1 || true)
-            
-            if [[ -z "$LATEST_DEST_SNAP_FULL" ]]; then
+            # === INTELLIGENTE SUCHE ===
+            # Wir holen ALLE Snapshots vom Ziel (sortiert Neueste -> Älteste)
+            DEST_SNAPS=$(zfs list -H -t snapshot -o name -S creation -d 1 "$DST" 2>/dev/null || true)
+
+            if [[ -z "$DEST_SNAPS" ]]; then
                 log "[FIX]  Ziel $DST existiert ohne Snapshots. Sende komplett neu."
                 PERFORM_FULL_SEND=1
             else
-                COMMON_SNAP_NAME="${LATEST_DEST_SNAP_FULL#*@}"
-                COMMON_SNAP_SRC="${CURRENT_DS}@${COMMON_SNAP_NAME}"
+                # Wir gehen die Liste durch und suchen den ERSTEN, den wir auch auf der Quelle haben
+                FOUND_MATCH=0
                 
-                if zfs list -t snapshot "$COMMON_SNAP_SRC" >/dev/null 2>&1; then
-                    if [[ "$COMMON_SNAP_SRC" == "$LATEST_SNAP" ]]; then
-                        log "[OK]   $DST ist aktuell."
+                for D_SNAP in $DEST_SNAPS; do
+                    SNAP_SHORT="${D_SNAP#*@}" # Nur der Name nach dem @
+                    SRC_MATCH_CANDIDATE="${CURRENT_DS}@${SNAP_SHORT}"
+
+                    # Existiert dieser Kandidat auf der Quelle?
+                    if zfs list -t snapshot "$SRC_MATCH_CANDIDATE" >/dev/null 2>&1; then
+                        COMMON_BASE_SNAP="$SRC_MATCH_CANDIDATE"
+                        log "[MATCH] Gemeinsame Basis gefunden: @$SNAP_SHORT"
+                        FOUND_MATCH=1
+                        break # Gefunden! Schleife abbrechen.
+                    fi
+                done
+
+                if [[ "$FOUND_MATCH" -eq 1 ]]; then
+                    # Wir haben eine Basis!
+                    if [[ "$COMMON_BASE_SNAP" == "$LATEST_SNAP" ]]; then
+                        log "[OK]   $DST ist bereits auf dem neuesten Stand."
                     else
-                        log "[INC]  Update $DST: @$COMMON_SNAP_NAME -> @${LATEST_SNAP#*@}"
-                        if ! zfs send -w -p -I "$COMMON_SNAP_SRC" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                        log "[INC]  Update $DST ab @${COMMON_BASE_SNAP#*@} -> @${LATEST_SNAP#*@}"
+                        # ZFS Receive -F (Force) ist wichtig, falls auf dem Ziel neuere (aber verwaiste) 
+                        # Snapshots liegen (wie die 'frequent' Dinger), die wir überschreiben müssen.
+                        if ! zfs send -w -p -I "$COMMON_BASE_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
                              log "[ERR]  Fehler beim inkrementellen Update."
                         fi
                     fi
                 else
-                    # SPLIT-BRAIN: Gemeinsamer Snapshot fehlt.
-                    log "[WARN] Split-Brain bei $DST! Gemeinsamer Snapshot @$COMMON_SNAP_NAME fehlt auf Quelle."
+                    # Wirklich gar nichts gefunden (auch kein Weekly etc.)
+                    log "[WARN] Echter Split-Brain bei $DST! Kein einziger gemeinsamer Snapshot gefunden."
                     log "[FIX]  Erzwinge Full-Resync: Lösche $DST und sende neu..."
-                    
                     if zfs destroy -r "$DST" 2>>"$LOGFILE"; then
                         PERFORM_FULL_SEND=1
                     else
@@ -266,7 +285,7 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             fi
         fi
 
-        # --- FULL SEND BLOCK (Wird bei INIT oder SELF-HEALING ausgeführt) ---
+        # --- FULL SEND BLOCK ---
         if [[ "$PERFORM_FULL_SEND" -eq 1 ]]; then
             if [[ "$BACKUP_MODE" == "latest" && "$LATEST_SNAP" != "$OLDEST_SNAP" ]]; then
                  zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"
