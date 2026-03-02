@@ -46,6 +46,7 @@ source "$CONFIG_FILE"
 BACKUP_MODE="${BACKUP_MODE:-full}"       # full oder latest
 FORCE_FULL_WIPE="${FORCE_FULL_WIPE:-no}" # yes oder no
 CHECKMK_EXPIRY_DAYS="${CHECKMK_EXPIRY_DAYS:-7}"
+PRUNE_OLD_SNAPSHOTS="${PRUNE_OLD_SNAPSHOTS:-yes}" # NEU: Verwaiste Snapshots auf dem Ziel loeschen
 
 ###############################################################################
 # CheckMK & Logging Basics
@@ -295,6 +296,22 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
                     zfs send -w -p -I "$OLDEST_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"
                  fi
             fi
+        fi
+
+        # --- PRUNE BLOCK (NEU) ---
+        if [[ "$PRUNE_OLD_SNAPSHOTS" == "yes" && "$DEST_EXISTS" -eq 1 ]]; then
+            # Alle Snapshots auf dem Ziel holen
+            DEST_SNAPS_TO_CHECK=$(zfs list -H -t snapshot -o name -S creation -d 1 "$DST" 2>/dev/null || true)
+            for D_SNAP in $DEST_SNAPS_TO_CHECK; do
+                SNAP_SHORT="${D_SNAP#*@}"
+                SRC_CHECK_SNAP="${CURRENT_DS}@${SNAP_SHORT}"
+                
+                # Wenn der Snapshot auf der Quelle NICHT existiert, loeschen wir ihn auf dem Ziel
+                if ! zfs list -t snapshot "$SRC_CHECK_SNAP" >/dev/null 2>&1; then
+                    log "[CLEANUP] Loesche alten/verwaisten Snapshot auf Ziel: @$SNAP_SHORT"
+                    zfs destroy "$D_SNAP" 2>>"$LOGFILE" || log "[WARN] Konnte $D_SNAP nicht loeschen."
+                fi
+            done
         fi
     done
 done
