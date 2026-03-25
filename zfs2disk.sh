@@ -56,7 +56,10 @@ HOSTNAME=$(hostname -f)
 CONFIG_BASENAME=$(basename "$CONFIG_FILE")
 SERVICE_NAME="${CONFIG_BASENAME%.*}"
 STATUSFILE="/var/log/${SERVICE_NAME}_status"
-SPOOL_FILE="${CHECKMK_SPOOL_DIR}/90000_${HOSTNAME}:${SERVICE_NAME}"
+
+# Sekunden für CheckMK berechnen (Tage * 24h * 60m * 60s)
+CHECKMK_EXPIRY_SECONDS=$(( CHECKMK_EXPIRY_DAYS * 86400 ))
+SPOOL_FILE="${CHECKMK_SPOOL_DIR}/${CHECKMK_EXPIRY_SECONDS}_${HOSTNAME}:${SERVICE_NAME}"
 
 log() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') [$SERVICE_NAME] - $1" | tee -a "$LOGFILE"
@@ -69,6 +72,11 @@ set_status() {
 
 create_checkmk_spool() {
     mkdir -p "$CHECKMK_SPOOL_DIR"
+    
+    # Wichtig: Alte Spool-Dateien für diesen Service löschen, 
+    # falls sich die CHECKMK_EXPIRY_DAYS geändert haben.
+    rm -f "${CHECKMK_SPOOL_DIR}/"*_"${HOSTNAME}:${SERVICE_NAME}" 2>/dev/null
+    
     EXPIRY_DATE=$(date -d "+$CHECKMK_EXPIRY_DAYS days" +'%Y-%m-%d')
     cat > "$SPOOL_FILE" << EOF
 <<<local>>>
