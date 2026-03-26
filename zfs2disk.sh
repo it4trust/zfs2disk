@@ -1,14 +1,13 @@
 #!/bin/bash
 # zfs2disk.sh – Backup-Skript für Proxmox mit ZFS
-# Version 3.4 - Smart Common Base Search
+# Version 3.5 - Fehler-Toleranz beim Full-Send
 #
 # Aufruf: ./zfs2disk.sh <config_file>
 #
-# NEU IN V3.4:
-# - Behebt das "Frequent-Trap" Problem: Wenn der neueste Snapshot auf dem Ziel
-#   nicht mehr auf der Quelle existiert, sucht das Skript rückwärts durch die 
-#   Historie, bis es EINEN gemeinsamen Snapshot (z.B. Weekly) findet.
-# - Verhindert unnötige Full-Wipes, solange noch irgendeine gemeinsame Basis existiert.
+# NEU IN V3.5:
+# - Die "Full Send"-Befehle wurden mit Fehlerbehandlung abgesichert. Wenn ZFS 
+#   bei einem Dataset den Dienst verweigert, stürzt nicht mehr das ganze Skript ab, 
+#   sondern es loggt den Fehler und macht mit dem nächsten Dataset weiter.
 
 LOGFILE="/var/log/zfs2disk.log"
 
@@ -46,7 +45,7 @@ source "$CONFIG_FILE"
 BACKUP_MODE="${BACKUP_MODE:-full}"       # full oder latest
 FORCE_FULL_WIPE="${FORCE_FULL_WIPE:-no}" # yes oder no
 CHECKMK_EXPIRY_DAYS="${CHECKMK_EXPIRY_DAYS:-7}"
-PRUNE_OLD_SNAPSHOTS="${PRUNE_OLD_SNAPSHOTS:-yes}" # NEU: Verwaiste Snapshots auf dem Ziel loeschen
+PRUNE_OLD_SNAPSHOTS="${PRUNE_OLD_SNAPSHOTS:-yes}" # Verwaiste Snapshots loeschen
 
 ###############################################################################
 # CheckMK & Logging Basics
@@ -73,8 +72,7 @@ set_status() {
 create_checkmk_spool() {
     mkdir -p "$CHECKMK_SPOOL_DIR"
     
-    # Wichtig: Alte Spool-Dateien für diesen Service löschen, 
-    # falls sich die CHECKMK_EXPIRY_DAYS geändert haben.
+    # Wichtig: Alte Spool-Dateien für diesen Service löschen
     rm -f "${CHECKMK_SPOOL_DIR}/"*_"${HOSTNAME}:${SERVICE_NAME}" 2>/dev/null
     
     EXPIRY_DATE=$(date -d "+$CHECKMK_EXPIRY_DAYS days" +'%Y-%m-%d')
@@ -275,14 +273,12 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
                         log "[OK]   $DST ist bereits auf dem neuesten Stand."
                     else
                         log "[INC]  Update $DST ab @${COMMON_BASE_SNAP#*@} -> @${LATEST_SNAP#*@}"
-                        # ZFS Receive -F (Force) ist wichtig, falls auf dem Ziel neuere (aber verwaiste) 
-                        # Snapshots liegen (wie die 'frequent' Dinger), die wir überschreiben müssen.
                         if ! zfs send -w -p -I "$COMMON_BASE_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
-                             log "[ERR]  Fehler beim inkrementellen Update."
+                             log "[ERR]  Fehler beim inkrementellen Update von $CURRENT_DS (Details im Log)."
                         fi
                     fi
                 else
-                    # Wirklich gar nichts gefunden (auch kein Weekly etc.)
+                    # Wirklich gar nichts gefunden
                     log "[WARN] Echter Split-Brain bei $DST! Kein einziger gemeinsamer Snapshot gefunden."
                     log "[FIX]  Erzwinge Full-Resync: Lösche $DST und sende neu..."
                     if zfs destroy -r "$DST" 2>>"$LOGFILE"; then
@@ -294,19 +290,28 @@ for SRC_ROOT in "${SOURCE_DATASETS[@]}"; do
             fi
         fi
 
-        # --- FULL SEND BLOCK ---
+        # --- FULL SEND BLOCK (Abgesichert) ---
         if [[ "$PERFORM_FULL_SEND" -eq 1 ]]; then
             if [[ "$BACKUP_MODE" == "latest" && "$LATEST_SNAP" != "$OLDEST_SNAP" ]]; then
-                 zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"
+                 if ! zfs send -w -p "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                     log "[ERR]  Fehler beim Single-Transfer von $LATEST_SNAP -> $DST (Details im Log)."
+                 fi
             else
-                 zfs send -w -p "$OLDEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"
-                 if [[ "$LATEST_SNAP" != "$OLDEST_SNAP" ]]; then
-                    zfs send -w -p -I "$OLDEST_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"
+                 # Erstes Basis-Backup
+                 if ! zfs send -w -p "$OLDEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                     log "[ERR]  Fehler beim Basis-Transfer von $OLDEST_SNAP -> $DST (Details im Log)."
+                 else
+                     # Wenn es mehr als einen Snapshot gibt, den Rest inkrementell nachschieben
+                     if [[ "$LATEST_SNAP" != "$OLDEST_SNAP" ]]; then
+                        if ! zfs send -w -p -I "$OLDEST_SNAP" "$LATEST_SNAP" 2>>"$LOGFILE" | zfs receive -F -u "$DST" 2>>"$LOGFILE"; then
+                            log "[ERR]  Fehler beim History-Transfer bis $LATEST_SNAP -> $DST (Details im Log)."
+                        fi
+                     fi
                  fi
             fi
         fi
 
-        # --- PRUNE BLOCK (NEU) ---
+        # --- PRUNE BLOCK ---
         if [[ "$PRUNE_OLD_SNAPSHOTS" == "yes" && "$DEST_EXISTS" -eq 1 ]]; then
             # Alle Snapshots auf dem Ziel holen
             DEST_SNAPS_TO_CHECK=$(zfs list -H -t snapshot -o name -S creation -d 1 "$DST" 2>/dev/null || true)
